@@ -1384,6 +1384,105 @@ def api_external_get_emails():
     return jsonify({'success': False, 'error': '无法获取邮件，所有方式均失败', 'details': all_errors})
 
 
+@app.route('/api/external/accounts/tags', methods=['POST'])
+@csrf_exempt
+@api_key_required
+def api_external_set_account_tags():
+    """对外 API：按邮箱账号批量打标签（供注册机等外部系统记录账号使用状态）。
+
+    请求体: {
+      "email": "user@outlook.com",          # 必填
+      "action": "add" | "remove" | "set" | "claim" | "unclaim",
+      "tags": ["Grok-成功"],                # 标签名列表（不存在会自动创建）；claim/unclaim 会忽略
+      "tag_prefix": "Grok-"                 # set/remove/claim/unclaim 仅影响该前缀标签；默认 Grok-
+    }
+
+    action 语义：
+      add      给账号添加标签（幂等）
+      remove   移除指定标签
+      set      清空该前缀全部标签后，再添加 tags（用于填写最终状态，如 ["Grok-成功"]）
+      claim    【原子占用】仅当账号没有任何该前缀标签时，打上 "{prefix}使用中" 并返回成功；
+               已被占用/已使用时返回 409（携带当前标签）——用于注册机分布式取号（防重复使用/崩溃悬挂）
+      unclaim  释放：仅移除 "{prefix}使用中"（若已存在 成功/失败 等终态标签则不动）
+
+    返回该账号当前全部标签。
+    """
+    data = request.get_json(silent=True) or {}
+    email = (str(data.get('email') or '')).strip()
+    action = (str(data.get('action') or 'add')).strip().lower()
+    raw_tags = data.get('tags') or []
+    tag_prefix = str(data.get('tag_prefix') or 'Grok-')
+
+    if not email:
+        return jsonify({'success': False, 'error': '缺少 email 参数'}), 400
+    if action not in ('add', 'remove', 'set', 'claim', 'unclaim'):
+        return jsonify({'success': False, 'error': 'action 仅支持 add/remove/set/claim/unclaim'}), 400
+    if action in ('add', 'set') and (
+            not isinstance(raw_tags, list) or not all(isinstance(t, str) for t in raw_tags)):
+        return jsonify({'success': False, 'error': 'tags 需为标签名字符串列表'}), 400
+    tags = [t.strip() for t in raw_tags if t.strip()] if isinstance(raw_tags, list) else []
+
+    account = resolve_account_for_email_api(email)
+    if not account:
+        return jsonify({'success': False, 'error': '邮箱账号不存在'}), 404
+    account_id = int(account['id'])
+    db = get_db()
+    in_use_name = f'{tag_prefix}使用中'
+    # add 需要至少一个标签；set 允许空列表（等价「清理该前缀全部标签」）
+    if action == 'add' and not tags:
+        return jsonify({'success': False, 'error': 'add 需要提供 tags'}), 400
+
+    if action == 'claim':
+        # 原子占用：BEGIN IMMEDIATE 串行化并发取号
+        try:
+            db.execute('BEGIN IMMEDIATE')
+            tag_rows = db.execute(
+                'SELECT t.id FROM tags t JOIN account_tags at ON at.tag_id = t.id '
+                'WHERE at.account_id = ? AND t.name LIKE ?',
+                (account_id, tag_prefix + '%')
+            ).fetchall()
+            if tag_rows:
+                db.rollback()
+                current = get_account_tags(account_id)
+                return jsonify({'success': True, 'available': False, 'tags': current}), 409
+            existing = db.execute('SELECT id FROM tags WHERE name = ?', (in_use_name,)).fetchone()
+            tag_id = existing['id'] if existing else None
+            if tag_id is None:
+                cur2 = db.execute('INSERT INTO tags (name, color) VALUES (?, ?)', (in_use_name, '#e7674f'))
+                tag_id = cur2.lastrowid
+            db.execute('INSERT OR IGNORE INTO account_tags (account_id, tag_id) VALUES (?, ?)',
+                       (account_id, tag_id))
+            db.commit()
+            current = get_account_tags(account_id)
+            return jsonify({'success': True, 'available': True, 'tags': current})
+        except Exception as exc:
+            try:
+                db.rollback()
+            except Exception:
+                pass
+            return jsonify({'success': False, 'error': f'claim 失败: {exc}'}), 500
+
+    if action == 'unclaim':
+        target = next((t for t in get_tags() if t.get('name') == in_use_name), None)
+        if target:
+            remove_account_tag(account_id, int(target['id']))
+        return jsonify({'success': True, 'tags': get_account_tags(account_id)})
+
+    if action in ('set', 'remove'):
+        for t in get_tags():
+            if str(t.get('name') or '').startswith(tag_prefix):
+                remove_account_tag(account_id, int(t['id']))
+    if action in ('add', 'set'):
+        for name in tags:
+            existing = next((t for t in get_tags() if t.get('name') == name), None)
+            tag_id = existing['id'] if existing else add_tag(name, '#00b7c3')
+            if tag_id:
+                add_account_tag(account_id, int(tag_id))
+
+    current = get_account_tags(account_id)
+    return jsonify({'success': True, 'tags': current})
+
+
 @app.route('/api/external/outlook/upload', methods=['POST'])
 @csrf_exempt
 @api_key_required
